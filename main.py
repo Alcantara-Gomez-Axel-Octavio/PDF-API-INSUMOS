@@ -15,7 +15,7 @@ else:
 
 app = FastAPI()
 
-# SECCIÓN 1: PARSERS ESPECÍFICOS POR PROVEEDOR ---
+# SECCIÓN 1: PARSERS ESPECÍFICOS POR PROVEEDOR 
 
 def parse_bayport(page, lines):
     data = {
@@ -24,7 +24,7 @@ def parse_bayport(page, lines):
         "characteristics": []
     }
     
-    # A. EXTRACCIÓN POR COORDENADAS (Zonas Basadas en Escaneo) ---
+    # A. EXTRACCIÓN POR COORDENADAS (Zonas Basadas en Escaneo)
 
     rect_shipped_to = (0, 230, 300, 302) 
     
@@ -35,7 +35,7 @@ def parse_bayport(page, lines):
         # Extraer Dirección Limpia
         addr_text = page.crop(rect_shipped_to).extract_text()
         if addr_text:
-            # Dividimos por líneas y limpiamos
+            
             data["shipped_to"] = [l.strip() for l in addr_text.split('\n') 
                                  if l.strip() and "SHIPPED TO" not in l]
 
@@ -49,7 +49,7 @@ def parse_bayport(page, lines):
     except Exception as e:
         print(f"Error en recorte: {e}")
     
-    # B. EXTRACCIÓN DE TABLA (Usando tus carriles de columna) 
+    # B. EXTRACCIÓN DE TABLA 
     v_lines = [0, 215, 285, 600] 
     rect_table = (0, 420, 600, 560) # Área de los datos de la tabla
 
@@ -63,7 +63,7 @@ def parse_bayport(page, lines):
         
         if table:
             for row in table:
-                # Limpiamos cada celda (quitamos guiones y ruidos)
+                # Limpiamos cada celda 
                 clean_row = [re.sub(r'[-_]{2,}', '', str(c)).strip() for c in row if c]
                 
                 # Solo procesamos si la fila tiene datos reales
@@ -75,7 +75,7 @@ def parse_bayport(page, lines):
                     })
     except: pass
 
-    # B. LÓGICA DE LÍNEAS (REGEX) ---
+    # B. LÓGICA DE LÍNEAS 
     for i, line in enumerate(lines):
         if "Date" == line and i + 1 < len(lines):
             data["header_info"]["date"] = lines[i+1]
@@ -85,7 +85,7 @@ def parse_bayport(page, lines):
             material_lines = lines[i+1 : i+4]
             data["header_info"]["material_our_/_Your_reference"] = " ".join(material_lines)
         
-        # Batch / Quantity / Railcar [cite: 23]
+        # Batch / Quantity / Railcar 
         if "Batch" in line and "Quantity" in line:
             batch = re.search(r'Batch\s+([A-Z0-9]+)', line)
             qty = re.search(r'Quantity\s+([\d,]+\s+LB)', line)
@@ -98,120 +98,106 @@ def parse_bayport(page, lines):
             
     return data
 
+
 def parse_bol(lines):
+    full_text = "\n".join(lines)
     data = {
         "header_info": {},
         "consignee": [],
         "send_freight_to": [],
-        "carrier_instructions": {},
         "materials": []
     }
+
+    # 1. ENCABEZADO (Totalmente Dinámico por Posición)
+    # \S+ captura cualquier cadena sin espacios. La fecha acepta letras, números, guiones y diagonales.
+    header_pattern = r'^(\S+)\s+(\S+)\s+([\d\-/A-Za-z]+)\s+(\S+)\s+(\S+)\s+(.*)$'
     
-    header_captured = False
-    full_text = "\n".join(lines)
-
     for i, line in enumerate(lines):
-        # 1. ENCABEZADO PRINCIPAL (Regex de números de control)
-        if not header_captured:
-            h_match = re.search(r'(\d{10}-\d{3})\s+(\d{10})\s+(\d{2}-[A-Za-z]{3}-\d{4})\s+(\d+)\s+([A-Z0-9]+)\s+(.*)', line)
-            if h_match:
-                data["header_info"].update({
-                    "bill_of_lading_no": h_match.group(1),
-                    "sales_order_no": h_match.group(2),
-                    "shipping_date": h_match.group(3),
-                    "ship_to_id": h_match.group(4),
-                    "vehicle_id": h_match.group(5),
-                    "customer_po": h_match.group(6)
-                })
-                header_captured = True
-
-        # 2. ROUTE Y ORIGIN (Línea inmediatamente después del encabezado 'ROUTE')
-        if "ROUTE" in line and "ORIGIN" in line:
-            if i + 1 < len(lines):
-                val_line = lines[i+1].strip()
-                # Separamos por espacios grandes para obtener Route (izq) y Origin (der)
-                parts = re.split(r'\s{3,}', val_line)
-                if len(parts) >= 2:
-                    data["header_info"]["route"] = parts[0]
-                    data["header_info"]["origin"] = parts[-1]
-
-        # 3. BLOQUE: INCO TERM / OFFEROR / SHIPPER
-        if "INCO/FREIGHT TERM" in line:
-            offer_parts = []
-            ship_parts = []
-            # Leemos las siguientes 4 líneas hasta llegar a 'SHIPPING CONDITION'
-            for offset in range(1, 5):
-                if i + offset < len(lines):
-                    row = lines[i + offset]
-                    if "SHIPPING CONDITION" in row or "1-800" in row: break
-                    
-                    cols = re.split(r'\s{2,}', row.strip())
-                    
-                    # El INCO TERM suele estar en la primera línea, primera columna
-                    if offset == 1 and len(cols) > 0:
-                        data["header_info"]["inco_term"] = cols[0]
-                    
-                    # Manejo dinámico de columnas para Direcciones
-                    # Si hay 3 columnas: [INCO, OFFEROR, SHIPPER]
-                    if len(cols) >= 3:
-                        offer_parts.append(cols[1])
-                        ship_parts.append(cols[2])
-                    # Si hay 2 columnas: [OFFEROR, SHIPPER]
-                    elif len(cols) == 2:
-                        offer_parts.append(cols[0])
-                        ship_parts.append(cols[1])
-            
-            data["header_info"]["offeror"] = ", ".join(offer_parts)
-            data["header_info"]["shipper"] = ", ".join(ship_parts)
-
-        # 4. SHIPPING CONDITION (Valor justo debajo del encabezado)
-        if "SHIPPING CONDITION" in line:
-            if i + 1 < len(lines):
-                # Tomamos la primera parte de la línea de abajo
-                cond_parts = re.split(r'\s{3,}', lines[i+1].strip())
-                data["header_info"]["shipping_condition"] = cond_parts[0]
-
-        # 5. CONSIGNEE Y SEND FREIGHT (Lectura de bloques paralelos)
-        if "CONSIGNEE" in line and "SEND FREIGHT" in line:
-            for j in range(1, 7):
+        # Buscamos la fila de los títulos
+        if "BILL OF LADING NO" in line and "SALES ORDER NO" in line:
+            # Revisamos las siguientes 1 o 2 líneas para extraer los valores
+            for j in range(1, 3):
                 if i + j < len(lines):
-                    row = lines[i + j].strip()
-                    # Parar si detectamos el siguiente encabezado o fin de sección
-                    if any(x in row for x in ["Carrier Instructions", "Section 7", "Pkgs"]): break
+                    data_line = lines[i+j].strip()
+                    # Ignorar si es una línea vacía o el siguiente encabezado
+                    if not data_line or "CARRIER" in data_line:
+                        continue
                     
-                    # Split por espacios grandes o anclas de dirección (PO Box / HOUSTON)
-                    parts = re.split(r'\s{3,}|(?=PO Box)|(?=HOUSTON)', row)
-                    if len(parts) >= 1 and parts[0]:
-                        data["consignee"].append(parts[0].strip())
-                    if len(parts) >= 2 and parts[1]:
-                        data["send_freight_to"].append(parts[1].strip())
+                    match = re.search(header_pattern, data_line)
+                    if match:
+                        data["header_info"] = {
+                            "bill_of_lading": match.group(1), 
+                            "sales_order": match.group(2),    
+                            "shipping_date": match.group(3),  
+                            "ship_to_id": match.group(4),     
+                            "vehicle_id": match.group(5),     
+                            "customer_po": match.group(6).strip() 
+                        }
+                        break 
+            
+            if data["header_info"]: 
+                break 
 
-        # 6. CARRIER INSTRUCTIONS (Fecha)
-        if "Carrier Instructions" in line:
-            d_match = re.search(r'(\d{4}-\d{2}-\d{2})', line)
-            if d_match: data["carrier_instructions"]["delivery_date"] = d_match.group(1)
+    # Si por alguna razón el OCR no encontró el encabezado, evitamos error inicializando el dict
+    if "header_info" not in data or not data["header_info"]:
+        data["header_info"] = {}
 
-    # 7. EXTRACCIÓN GLOBAL (Embargos y Materiales)
-    # Buscamos en todo el texto patrones técnicos fijos
-    emb_match = re.search(r'EMBARGO NUMBER:\s*([A-Z0-9]+)', full_text)
-    per_match = re.search(r'PERMIT NUMBER:\s*([A-Z0-9]+)', full_text)
-    if emb_match: data["carrier_instructions"]["embargo_no"] = emb_match.group(1)
-    if per_match: data["carrier_instructions"]["permit_no"] = per_match.group(1)
+    # 2. SEPARACIÓN DE DIRECCIONES 
+    is_address = False
+    for line in lines:
+        if "CONSIGNEE" in line and "SEND FREIGHT" in line:
+            is_address = True
+            continue
+        if is_address:
+            if any(x in line for x in ["Section 7", "Carrier Instructions", "Pkes"]):
+                is_address = False
+                continue
+            
+            # Volvemos a las anclas probadas que no rompen nombres como 'INC'
+            parts = re.split(r'(EQUISTAR|PO Box|HOUSTON TX)', line, maxsplit=1)
+            
+            if len(parts) > 1:
+                data["consignee"].append(parts[0].strip())
+                data["send_freight_to"].append("".join(parts[1:]).strip())
+            elif line.strip():
+                data["consignee"].append(line.strip())
 
-    # Pesos y Lotes (Patrón: Lote de 10 caracteres + Peso LBS)
-    w_match = re.search(r'([A-Z0-9]{10})\s+([\d,]+\s+LBS)', full_text)
-    if w_match:
-        # Intentamos capturar sellos y otros pesos si existen
-        s_match = re.search(r'Seal Numbers:\s*(\d+)', full_text)
-        g_weight = re.search(r'Veh\.\sGross\sWeight:\s*([\d,]+)', full_text)
-        
-        data["materials"].append({
-            "material": "POLYETHYLENE", # Se puede dinamizar buscando el texto previo al lote
-            "lot_number": w_match.group(1),
-            "net_weight": w_match.group(2),
-            "seal_numbers": s_match.group(1) if s_match else "N/A",
-            "gross_weight": g_weight.group(1) if g_weight else "N/A"
-        })
+    data["consignee"] = list(dict.fromkeys(filter(None, data["consignee"])))
+    data["send_freight_to"] = list(dict.fromkeys(filter(None, data["send_freight_to"])))
+
+    # 3. EMBARGOS, PERMISOS Y FECHAS 
+    delivery = re.search(r'Delivery date\s*:\s*([\d\-/A-Za-z]+)', full_text) 
+    embargo = re.search(r'EMBARGO NUMBER:\s*([A-Z0-9]+?)(?=EMBARGO|PERMIT|$)', full_text) 
+    permit = re.search(r'PERMIT NUMBER:\s*([A-Z0-9]+)', full_text) 
+    
+    data["header_info"]["delivery_date"] = delivery.group(1) if delivery else "N/A"
+    data["header_info"]["embargo_no"] = embargo.group(1) if embargo else "N/A"
+    data["header_info"]["permit_no"] = permit.group(1) if permit else "N/A"
+
+    # 4. PESOS, LOTE Y MATERIAL 
+    gross = re.search(r'Gross\s*Weight:\s*([\d,]+)', full_text) 
+    tare = re.search(r'Tare\s*Weight:\s*([\d,]+)', full_text)   
+    seal = re.search(r'Seal\s*Numbers:\s*(\d+)', full_text)     
+    
+    # Net Weight: Busca número antes de LBS o L BS
+    net_match = re.search(r'([\d,]{4,})\s*(?:L\s*BS|LBS)', full_text)
+    if not net_match:
+        net_match = re.search(r'TOTALin\s*LBS\s*([\d,]+)', full_text)
+
+    # Lote: Busca serie alfanumérica cerca del peso
+    lot = re.search(r'\b([A-Z0-9]{7,15})\s+[\d,]+\s*(?:L\s*BS|LBS)', full_text) 
+
+    # Descripción: Busca el valor después de 
+    desc_match = re.search(r'NMFC:[^,\n]+,?\s*\n?(.*?)(?:, NON_REG|\n)', full_text)
+
+    data["materials"].append({
+        "description": desc_match.group(1).strip() if desc_match else "Material Desconocido",
+        "lot_number": lot.group(1) if lot else "N/A",
+        "net_weight": net_match.group(1) if net_match else "N/A",
+        "gross_weight": gross.group(1) if gross else "N/A",
+        "tare_weight": tare.group(1) if tare else "N/A",
+        "seal_number": seal.group(1) if seal else "N/A"
+    })
 
     return data
 
@@ -370,7 +356,7 @@ def parse_coa(page, lines):
                     "test_method": prop["test_method"].strip()
                 })
             else:
-                # Si falló la asignación por columnas, limpiamos los guiones y forzamos el guardado
+                # Si falló la asignación por columnas, limpia los guiones y forza el guardado
                 clean_line = line_text.replace('_', '')
                 clean_line = re.sub(r'\s+', ' ', clean_line).strip()
                 
@@ -400,7 +386,7 @@ def parse_coa(page, lines):
 
     return data
 
-import re
+
 
 def parse_nova(page):
    
@@ -450,8 +436,6 @@ def parse_nova(page):
         x = w['x0']
         y = w['top']
         txt = w['text']
-
-        # PARTE 1: ENCABEZADOS PRINCIPALES 
         
         # 1. SHIP DATE (Coord: X ~360, Y ~70)
         if 350 < x < 420 and 65 < y < 75:
@@ -474,9 +458,6 @@ def parse_nova(page):
             if y_rounded not in invoice_address_lines:
                 invoice_address_lines[y_rounded] = []
             invoice_address_lines[y_rounded].append(txt)
-
-            
-        # PARTE 2: BLOQUES DE FECHAS Y ADUANAS 
 
         # 5. EMERGENCY CONTACT (Coord: X > 350, Y de 26 a 60)
         if x > 350 and 20 < y < 60:
@@ -520,8 +501,6 @@ def parse_nova(page):
             else:
                 data["header_info"]["customer_order"] += " " + txt
 
-        #  PARTE 3: COLUMNA IZQUIERDA Y SELLOS ---
-
         # 11. CONSIGNEE (Coord: X < 350, Y de 115 a 205)
         if x < 350 and 115 < y < 205:
             y_rounded = round(y, 1)
@@ -530,7 +509,7 @@ def parse_nova(page):
             cons_address_lines[y_rounded].append(txt)
 
         # 12. DESTINATION & ROUTE (Coord: X < 350, Y de 225 a 250)
-        # Captura "SAN LUIS POTOSI, SL" y la ruta en un solo campo
+        
         if x < 350 and 225 < y < 250:
             if not data["header_info"]["route"]:
                 data["header_info"]["route"] = txt
@@ -562,8 +541,6 @@ def parse_nova(page):
             else:
                 data["header_info"]["seal_numbers"] += " " + txt
 
-    # PARTE 4: TABLA DE MATERIALES 
-    
     # 1. Extracción de identificadores del material
     m_batch = re.search(r"Batch:\s*([A-Z0-9]+)", full_text)
     m_order_item = re.search(r"Order/item:\s*([\d/]+)", full_text)
@@ -777,6 +754,13 @@ async def clean_pdf(file: UploadFile = File(...)):
 
         # 4. IDENTIFICACIÓN Y PARSEO
         parser_type = get_parser_type(file.filename, lines)
+        
+        # EL BLOQUEO: Si es OCR (imagen) y NO es BOL, lo rechazamos inmediatamente
+        if method_used == "OCR" and parser_type not in ["bol", "bol_equistar", "unknown"]:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Formato inválido. El proveedor {parser_type.upper()} requiere un PDF original de texto, no un documento escaneado/imagen."
+            )
         
         if parser_type == "bayport":
             # Para Bayport seguimos usando las coordenadas de first_page
