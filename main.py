@@ -5,6 +5,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pdf2image import convert_from_bytes
 import pdfplumber
 import re
+import gc
+import uvicorn
 
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
@@ -953,7 +955,7 @@ def parse_westlake_coa(all_text):
     m_qty = re.search(r"Quantity\s+([\d,.]+)\s*(LB|KG)?", all_text)
     if m_qty: data["header_info"]["quantity"] = f"{m_qty.group(1).strip()} {m_qty.group(2) or ''}".strip()
 
-    # 3. TABLA DE PROPIEDADES ( 
+    # 3. TABLA DE PROPIEDADES 
     
     prop_matches = re.findall(r"(Melt Index|Density|Slip|Anitblock|Antiblock)\s+([A-Za-z0-9/]+)\s+([\d.]+)", all_text, re.IGNORECASE)
     
@@ -972,7 +974,6 @@ def parse_westlake_coa(all_text):
 def get_parser_type(filename, lines):
     """Identificación por prefijo exacto en el nombre (2 palabras), con respaldo de texto"""
     
-    # 1. INTENTO POR NOMBRE (Para los archivos bien nombrados como "BAYPORT BOL.pdf")
     name = filename.lower().replace(".pdf", "").replace("_", " ").replace("-", " ").strip()
     words = name.split()
     
@@ -994,39 +995,42 @@ def get_parser_type(filename, lines):
 
 @app.post("/clean-pdf")
 async def clean_pdf(file: UploadFile = File(...)):
+    contents = None
+    images = None
+    first_page = None
+    
     try:
         contents = await file.read()
-        
-        # 1. INTENTO DE EXTRACCIÓN DIRECTA (pdfplumber)
         all_text = ""
-        first_page = None
+        method_used = "Direct"
         
+
         with pdfplumber.open(io.BytesIO(contents)) as pdf:
-            first_page = pdf.pages[0] 
+            if len(pdf.pages) > 0:
+                first_page = pdf.pages[0] 
+                
             for p in pdf.pages:
                 text = p.extract_text()
                 if text: 
                     all_text += text + "\n"
         
-        # 2. DETECCIÓN DE "PDF FANTASMA" -> ACTIVAR OCR
-        method_used = "Direct"
+        # DETECCIÓN DE "PDF IMAGEN" -> ACTIVAR OCR
         if not all_text.strip():
             method_used = "OCR"
-            
             images = convert_from_bytes(contents, poppler_path=POPPLER_PATH)
             for img in images:
                 all_text += pytesseract.image_to_string(img, lang='spa+eng') + "\n"
+                img.close() 
+            
+            del images 
 
-        # 3. LIMPIEZA DE LÍNEAS (Estandarización)
         lines = [l.strip() for l in all_text.replace('\xa0', ' ').split('\n') if l.strip()]
         
         if not lines:
             raise HTTPException(status_code=400, detail="No se pudo extraer texto del archivo")
 
-        # 4. IDENTIFICACIÓN Y PARSEO
         parser_type = get_parser_type(file.filename, lines)
         
-        # EL BLOQUEO: Si es OCR (imagen) y NO es BOL, lo rechazamos inmediatamente
         bol_permitidos_ocr = ["bayport_bol", "equistar_bol", "nova_bol", "westlake_bol", "unknown"]
         if method_used == "OCR" and parser_type not in bol_permitidos_ocr:
             raise HTTPException(
@@ -1034,12 +1038,10 @@ async def clean_pdf(file: UploadFile = File(...)):
                 detail=f"Formato inválido. El documento {parser_type.upper()} requiere un PDF original de texto, no un documento escaneado/imagen."
             )
         
-        # 5. ENRUTAMIENTO A TUS MÉTODOS NUEVOS
         if parser_type == "bayport_bol":
             structured_data = parse_bayport_bol(lines)
         elif parser_type == "bayport_coa":
             structured_data = parse_bayport_coa(first_page, lines)
-            
         elif parser_type == "equistar_bol":
             structured_data = parse_equistar_bol(lines)
         elif parser_type == "equistar_coa":
@@ -1052,7 +1054,6 @@ async def clean_pdf(file: UploadFile = File(...)):
             structured_data = parse_westlake_bol(first_page, lines)
         elif parser_type == "westlake_coa":
             structured_data = parse_westlake_coa(all_text)
-            
         else:
             raise HTTPException(status_code=400, detail="Proveedor no reconocido")
 
@@ -1066,9 +1067,17 @@ async def clean_pdf(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # 6. LIMPIEZA FORZADA DE MEMORIA 
+        del contents
+        del first_page
+        
+        # Forzamos al sistema a barrer la basura de la RAM en este instante
+        gc.collect()
 
 
 
 if __name__ == "__main__":
-    import uvicorn
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
